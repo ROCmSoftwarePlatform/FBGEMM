@@ -25,8 +25,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-#define SPLIT_TBE_FWD_KERNEL(emb_prec, emb_type, embedding_dim, bag_prefetch, bag_unroll) \
-    extern "C" __global__ void split_tbe_fwd_hip_kernel_ ## emb_prec ## _e ## embedding_dim ( \
+#define SPLIT_TBE_FWD_KERNEL(emb_prec, emb_type, bag_prefetch, bag_unroll) \
+    extern "C" __global__ void split_tbe_fwd_hip_kernel_ ## emb_prec ( \
             float * p_output,              \
             const emb_type * p_emb_table,  \
             const int64_t * p_indices,     \
@@ -37,12 +37,6 @@
             uint32_t num_rows,             \
             uint32_t num_tables)
 
-SPLIT_TBE_FWD_KERNEL(fp16,  half,  64, 2, 16);
-SPLIT_TBE_FWD_KERNEL(fp16,  half, 128, 2, 16);
-SPLIT_TBE_FWD_KERNEL(fp16,  half, 192, 2, 16);
-SPLIT_TBE_FWD_KERNEL(fp16,  half, 256, 2, 16);
+SPLIT_TBE_FWD_KERNEL(fp16,  half, 2, 16);
 
-SPLIT_TBE_FWD_KERNEL(fp32, float,  64, 2, 16);
-SPLIT_TBE_FWD_KERNEL(fp32, float, 128, 2, 16);
-SPLIT_TBE_FWD_KERNEL(fp32, float, 192, 2, 16);
-SPLIT_TBE_FWD_KERNEL(fp32, float, 256, 2, 16);
+SPLIT_TBE_FWD_KERNEL(fp32, float, 2, 16);

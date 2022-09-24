@@ -31,6 +31,64 @@ typedef float  floatx2_t __attribute__((ext_vector_type(2)));
 #define AMDGCN_BUFFER_RES_3 0x00027000
 #define AMDGCN_WAVE_SIZE 64
 
+#define CURR_MAX_EMB_DIM 256
+
+#define LOOP_COMPUTATION(embedding_dim) do {                                                                                             \
+    for( ; itr<length_mod; itr += bag_unroll){                                                                                           \
+        load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[0], indices[0], p_emb_table, lane_id);                         \
+        load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[CURR_MAX_EMB_DIM], indices[1], p_emb_table, lane_id);          \
+                                                                                                                                         \
+        for(int j = 2 ; j < bag_unroll; j += 2){                                                                                         \
+            accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[0], lane_id);                     \
+            load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[0], indices[j], p_emb_table, lane_id);                     \
+                                                                                                                                         \
+            accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[CURR_MAX_EMB_DIM], lane_id);      \
+            load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[CURR_MAX_EMB_DIM], indices[j+1], p_emb_table, lane_id);    \
+        }                                                                                                                                \
+                                                                                                                                         \
+        for(int i=0; i < bag_unroll; i++){                                                                                               \
+            indices[i] = p_indices[i];                                                                                                   \
+        }                                                                                                                                \
+        p_indices += bag_unroll;                                                                                                         \
+                                                                                                                                         \
+        accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0], &emb_data[0], lane_id);                          \
+        accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[CURR_MAX_EMB_DIM], lane_id);          \
+    }                                                                                                                                    \
+    load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[0], indices[0], p_emb_table, lane_id);                             \
+    load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[CURR_MAX_EMB_DIM], indices[1], p_emb_table, lane_id);              \
+                                                                                                                                         \
+    for(int j = 2 ; j < bag_unroll; j += 2){                                                                                             \
+        accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[0], lane_id);                         \
+        load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[0], indices[j], p_emb_table, lane_id);                         \
+                                                                                                                                         \
+        accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[CURR_MAX_EMB_DIM], lane_id);          \
+        load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[CURR_MAX_EMB_DIM], indices[j+1], p_emb_table, lane_id);        \
+    }                                                                                                                                    \
+    accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[0], lane_id);                             \
+    accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[CURR_MAX_EMB_DIM], lane_id);              \
+} while(0)
+
+#define LAST_AND_STORE(embedding_dim) do {                                                                                               \
+    if(length & (bag_unroll - 1)){                                                                                                       \
+        do {                                                                                                                             \
+            indices[0] = p_indices[0];                                                                                                   \
+            p_indices++;                                                                                                                 \
+                                                                                                                                         \
+            load_row_per_warp<emb_t, (embedding_dim), index_t>::run(&emb_data[0], indices[0], p_emb_table, lane_id);                     \
+            accumulate_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0],  &emb_data[0], lane_id);                     \
+                                                                                                                                         \
+            itr++;                                                                                                                       \
+        }while(itr < length);                                                                                                            \
+    }                                                                                                                                    \
+    if (static_cast<fbgemm_gpu::PoolingMode>(pooling_mode) == fbgemm_gpu::PoolingMode::MEAN && length != 0){                             \
+        for (int i = 0; i < dword_output_per_row; i++){                                                                                  \
+            accumulator[i] *= 1.0f / length;                                                                                             \
+        }                                                                                                                                \
+    }                                                                                                                                    \
+                                                                                                                                         \
+    store_row_per_warp<emb_t, (embedding_dim), output_t>::run(&accumulator[0], p_output, lane_id);                                       \
+} while(0)
+
 template <typename T>
 union amdgcn_buffer_resource{
     // https://rocm-documentation.readthedocs.io/en/latest/GCN_ISA_Manuals/testdocbook.html#vector-memory-buffer-instructions
@@ -211,7 +269,6 @@ template <
     typename cache_t,
     typename output_t,
     typename index_t,
-    int32_t embedding_dim,
     int32_t bag_prefetch,
     int32_t bag_unroll>
 __device__ void split_tbe_forward_unweighted_hip_kernel(
@@ -225,7 +282,9 @@ __device__ void split_tbe_forward_unweighted_hip_kernel(
     uint32_t num_rows,
     uint32_t num_tables)
 {
-    constexpr uint32_t dword_output_per_row = (embedding_dim + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+    constexpr unsigned  MAX_COLS_PER_THREAD = CURR_MAX_EMB_DIM / THREADS_PER_ROW;
+
+    const uint32_t dword_output_per_row = (emb_dim + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
     // constexpr uint32_t input_data_per_dword = 4 / sizeof(emb_t);    // TODO: larger than 4 byte
     // constexpr uint32_t dword_input_per_row = (dword_output_per_row + input_data_per_dword - 1) / input_data_per_dword;
     // constexpr uint32_t dword_input_per_row_rounded = dword_input_per_row == 1 ? dword_input_per_row
@@ -234,9 +293,9 @@ __device__ void split_tbe_forward_unweighted_hip_kernel(
 
     static_assert(bag_prefetch < bag_unroll, "");
 
-    float accumulator[dword_output_per_row];
+    float accumulator[MAX_COLS_PER_THREAD];
     index_t indices[bag_unroll];
-    emb_t emb_data[embedding_dim * bag_prefetch];
+    emb_t emb_data[BLOCK_SIZE * bag_prefetch];
 
     int wave_id = __builtin_amdgcn_readfirstlane(threadIdx.x / AMDGCN_WAVE_SIZE);
     int bag_id = (blockIdx.x << 2) | wave_id;
@@ -264,18 +323,45 @@ __device__ void split_tbe_forward_unweighted_hip_kernel(
     int32_t length_mod = length & length_mask;
 
     int itr = 0;
-    if(length_mod == 0)
-        goto L_end;
+    if(length_mod != 0){
 
-    #pragma unroll
-    for(int i=0; i < bag_unroll; i++){
-        indices[i] = p_indices[i];
+#pragma unroll
+        for(int i=0; i < bag_unroll; i++){
+            indices[i] = p_indices[i];
+        }
+
+        itr += bag_unroll;
+        p_indices += bag_unroll;
+
+        // LOOP
+        switch (emb_dim){
+            case 64:
+                LOOP_COMPUTATION(64);
+                break;
+            case 128:
+                LOOP_COMPUTATION(128);
+                break;
+            case 192:
+                LOOP_COMPUTATION(192);
+                break;
+            case 256:
+                LOOP_COMPUTATION(256);
+        }
     }
-
-    itr += bag_unroll;
-    p_indices += bag_unroll;
-
-    // LOOP
+    switch (emb_dim){
+        case 64:
+            LAST_AND_STORE(64);
+            return;
+        case 128:
+            LAST_AND_STORE(128);
+            return;
+        case 192:
+            LAST_AND_STORE(192);
+            return;
+        case 256:
+            LAST_AND_STORE(256);
+    }
+    /*
     for( ; itr<length_mod; itr += bag_unroll){
         load_row_per_warp<emb_t, embedding_dim, index_t>::run(&emb_data[0], indices[0], p_emb_table, lane_id);
         load_row_per_warp<emb_t, embedding_dim, index_t>::run(&emb_data[embedding_dim], indices[1], p_emb_table, lane_id);
@@ -336,11 +422,12 @@ L_end:
 
     // store out
     store_row_per_warp<emb_t, embedding_dim, output_t>::run(&accumulator[0], p_output, lane_id);
+    */
 }
 
 
-#define SPLIT_TBE_FWD_KERNEL(emb_prec, emb_type, embedding_dim, bag_prefetch, bag_unroll) \
-    extern "C" __global__ void split_tbe_fwd_hip_kernel_ ## emb_prec ## _e ## embedding_dim ( \
+#define SPLIT_TBE_FWD_KERNEL(emb_prec, emb_type, bag_prefetch, bag_unroll) \
+    extern "C" __global__ void split_tbe_fwd_hip_kernel_ ## emb_prec ( \
             float * p_output,              \
             const emb_type * p_emb_table,  \
             const int64_t * p_indices,     \
@@ -351,18 +438,12 @@ L_end:
             uint32_t num_rows,             \
             uint32_t num_tables)           \
     {                                      \
-        split_tbe_forward_unweighted_hip_kernel<emb_type, float, float, int64_t, embedding_dim, bag_prefetch, bag_unroll> \
+        split_tbe_forward_unweighted_hip_kernel<emb_type, float, float, int64_t, bag_prefetch, bag_unroll> \
                 (p_output, p_emb_table, p_indices, p_offsets, pooling_mode, emb_dim, batch, num_rows, num_tables); \
     }
 
-SPLIT_TBE_FWD_KERNEL(fp16,  half,  64, 2, 16)
-SPLIT_TBE_FWD_KERNEL(fp16,  half, 128, 2, 16)
-SPLIT_TBE_FWD_KERNEL(fp16,  half, 192, 2, 16)
-SPLIT_TBE_FWD_KERNEL(fp16,  half, 256, 2, 16)
+SPLIT_TBE_FWD_KERNEL(fp16,  half, 2, 16)
 
-SPLIT_TBE_FWD_KERNEL(fp32, float,  64, 2, 16)
-SPLIT_TBE_FWD_KERNEL(fp32, float, 128, 2, 16)
-SPLIT_TBE_FWD_KERNEL(fp32, float, 192, 2, 16)
-SPLIT_TBE_FWD_KERNEL(fp32, float, 256, 2, 16)
+SPLIT_TBE_FWD_KERNEL(fp32, float, 2, 16)
 
 #endif

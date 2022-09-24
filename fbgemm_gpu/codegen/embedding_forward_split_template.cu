@@ -600,49 +600,35 @@ Tensor {{ "dense" if dense else "split" }}_embedding{{ "_nobag" if nobag else ""
             args.num_rows = E;
             args.num_tables = (uint32_t) T;
 
-            if (prec == "fp16") {
-                void (*kf_p)(float *, const half *, const int64_t *, const int64_t *, const int64_t, uint32_t, uint32_t, uint32_t, uint32_t);
-                if (max_D == 64) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp16_e64;
-                } else if (max_D == 128) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp16_e128;
-                } else if (max_D == 192) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp16_e192;
-                } else if (max_D == 256) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp16_e256;
+	    if ((max_D ==  64) || (max_D == 128)
+	        || (max_D == 192) || (max_D == 256)) {
+                if (prec == "fp16") {
+	            void (*kf_p)(float *, const half *, const int64_t *, const int64_t *, const int64_t, uint32_t, uint32_t, uint32_t, uint32_t);
+	            kf_p = split_tbe_fwd_hip_kernel_fp16;
+                    hipLaunchKernelGGL(kf_p,
+                        dim3(grids[0], grids[1], grids[2]),
+                        dim3(blocks[0], blocks[1], blocks[2]),
+                        0, 0,
+                        (float *)args.output, (const half *)args.emb_table, args.indices, args.offsets, args.pooling_mode,
+                        args.emb_dim, args.batch, args.num_rows, args.num_tables);
+                    return output;
+                } else if (prec == "fp32"){
+	            void (*kf_p)(float *, const float *, const int64_t *, const int64_t *, const int64_t, uint32_t, uint32_t, uint32_t, uint32_t);
+	            kf_p = split_tbe_fwd_hip_kernel_fp32;
+                    hipLaunchKernelGGL(kf_p,
+                        dim3(grids[0], grids[1], grids[2]),
+                        dim3(blocks[0], blocks[1], blocks[2]),
+                        0, 0,
+                        (float *)args.output, (const float *)args.emb_table, args.indices, args.offsets, args.pooling_mode,
+                        args.emb_dim, args.batch, args.num_rows, args.num_tables);
+                    return output;
                 } else {
-                    printf("Unsupported TBE dimension (%ld)", (long)max_D);
-                    exit(1);
-                }
-                hipLaunchKernelGGL(*kf_p,
-                    dim3(grids[0], grids[1], grids[2]),
-                    dim3(blocks[0], blocks[1], blocks[2]),
-                    0, 0,
-                    (float *)args.output, (const half *)args.emb_table, args.indices, args.offsets, args.pooling_mode,
-                    args.emb_dim, args.batch, args.num_rows, args.num_tables);
-
-            } else { // "fp32"
-                void (*kf_p)(float *, const float *, const int64_t *, const int64_t *, const int64_t, uint32_t, uint32_t, uint32_t, uint32_t);
-                if (max_D == 64) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp32_e64;
-                } else if (max_D == 128) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp32_e128;
-                } else if (max_D == 192) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp32_e192;
-                } else if (max_D == 256) {
-                    kf_p = &split_tbe_fwd_hip_kernel_fp32_e256;
-                } else {
-                    printf("Unsupported TBE dimension (%ld)", (long)max_D);
-                    exit(1);
-                }
-                hipLaunchKernelGGL(*kf_p,
-                    dim3(grids[0], grids[1], grids[2]),
-                    dim3(blocks[0], blocks[1], blocks[2]),
-                    0, 0,
-                    (float *)args.output, (const float *)args.emb_table, args.indices, args.offsets, args.pooling_mode,
-                    args.emb_dim, args.batch, args.num_rows, args.num_tables);
-            }
-            return output;
+	            printf("Unrecogized data type.\n");
+		    exit(1);
+		}
+	    }
+            printf("Unsupported TBE dimension (%ld)", (long)max_D);
+            exit(1);
         }
     }
     {% endif %}  // not weighted
