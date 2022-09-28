@@ -537,7 +537,7 @@ Tensor {{ "dense" if dense else "split" }}_embedding{{ "_nobag" if nobag else ""
     {% if not nobag %}
     {% if not dense %}
 
-    std::set<int> D_emb_s {64, 128, 192, 256};
+    // std::set<int> D_emb_s {64, 128, 192, 256};
 
     // weight param cnt
     int64_t wcnts = dev_weights.numel();
@@ -558,9 +558,9 @@ Tensor {{ "dense" if dense else "split" }}_embedding{{ "_nobag" if nobag else ""
     if (guard_ex)  guard_ex = all_devs && no_dupt;
 
     // row dims options
-    bool dims_opt = (D_emb_s.find(max_D) != D_emb_s.end());
+    // bool dims_opt = (D_emb_s.find(max_D) != D_emb_s.end());
 
-    if (guard_ex && (dev_weights.scalar_type() == at::ScalarType::Half || dev_weights.scalar_type() == at::ScalarType::Float) && dims_opt) {
+    if (guard_ex && (dev_weights.scalar_type() == at::ScalarType::Half || dev_weights.scalar_type() == at::ScalarType::Float)) {
         constexpr uint32_t workgroup_size = 256;
         constexpr uint32_t wave_size = 64;
 
@@ -609,13 +609,13 @@ Tensor {{ "dense" if dense else "split" }}_embedding{{ "_nobag" if nobag else ""
                 {% else %}
                 void (*kf_p)(float *, const half *, const int64_t *, const int64_t *, const int64_t, const float *, uint32_t, uint32_t, uint32_t, uint32_t);
                 {% endif %}
-                if (max_D == 64) {
+                if (max_D <= 64) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp16_e64;
-                } else if (max_D == 128) {
+                } else if (max_D <= 128) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp16_e128;
-                } else if (max_D == 192) {
+                } else if (max_D <= 192) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp16_e192;
-                } else if (max_D == 256) {
+                } else if (max_D <= 256) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp16_e256;
                 } else {
                     printf("Unsupported TBE dimension (%ld)", (long)max_D);
@@ -637,18 +637,19 @@ Tensor {{ "dense" if dense else "split" }}_embedding{{ "_nobag" if nobag else ""
                 {% else %}
                 void (*kf_p)(float *, const float *, const int64_t *, const int64_t *, const int64_t, const float *, uint32_t, uint32_t, uint32_t, uint32_t);
                 {% endif %}
-                if (max_D == 64) {
+                if (max_D <= 64) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp32_e64;
-                } else if (max_D == 128) {
+                } else if (max_D <= 128) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp32_e128;
-                } else if (max_D == 192) {
+                } else if (max_D <= 192) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp32_e192;
-                } else if (max_D == 256) {
+                } else if (max_D <= 256) {
                     kf_p = &split_tbe_fwd_{{ wdesc }}_hip_kernel_fp32_e256;
                 } else {
                     printf("Unsupported TBE dimension (%ld)", (long)max_D);
                     exit(1);
                 }
+                
                 hipLaunchKernelGGL(*kf_p,
                     dim3(grids[0], grids[1], grids[2]),
                     dim3(blocks[0], blocks[1], blocks[2]),

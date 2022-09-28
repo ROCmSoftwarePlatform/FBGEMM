@@ -25,7 +25,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "../codegen/embedding_forward_template_helpers_hip.cuh"
-
 typedef int32_t  int32x4_t __attribute__((ext_vector_type(4)));
 typedef float  floatx2_t __attribute__((ext_vector_type(2)));
 #define AMDGCN_BUFFER_RES_3 0x00027000
@@ -254,10 +253,13 @@ __device__ void split_tbe_forward_hip_kernel(
     if(bag_id >= batch)
         return ;
     int lane_id = threadIdx.x & (AMDGCN_WAVE_SIZE - 1);
-
+    int num_loads = (emb_dim + AMDGCN_WAVE_SIZE - 1) >> 6;
+    if( lane_id * num_loads > emb_dim)
+        return;
     p_offsets += blockIdx.y * batch + bag_id;
     index_t indices_start = p_offsets[0];
     index_t indices_end = p_offsets[1];
+    
 
     uint64_t emb_table_stride = static_cast<uint64_t>(num_rows) * emb_dim;
     uint64_t out_bag_stride = num_tables * emb_dim;
@@ -301,14 +303,18 @@ __device__ void split_tbe_forward_hip_kernel(
     if constexpr (weighted) {
         p_indice_weights += bag_unroll;
     }
-
+    
     // LOOP
+    //Load initial two rows of data
     for( ; itr<length_mod; itr += bag_unroll){
         load_row_per_warp<emb_t, embedding_dim, index_t>::run(&emb_data[0], indices[0], p_emb_table, lane_id);
         load_row_per_warp<emb_t, embedding_dim, index_t>::run(&emb_data[embedding_dim], indices[1], p_emb_table, lane_id);
 
 	if constexpr (!weighted) {
             #pragma unroll
+            // accumulate previous two loads
+            // load next two indices
+            //
             for(int j = 2 ; j < bag_unroll; j += 2){
                 accumulate_row_per_warp<emb_t, embedding_dim, output_t, weighted>::run(&accumulator[0],  &emb_data[0], lane_id);
                 load_row_per_warp<emb_t, embedding_dim, index_t>::run(&emb_data[0], indices[j], p_emb_table, lane_id);
