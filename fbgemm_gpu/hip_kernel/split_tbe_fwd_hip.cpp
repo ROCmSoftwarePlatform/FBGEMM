@@ -254,7 +254,7 @@ __device__ void split_tbe_forward_hip_kernel(
         return ;
     int lane_id = threadIdx.x & (AMDGCN_WAVE_SIZE - 1);
     int num_loads = (emb_dim + AMDGCN_WAVE_SIZE - 1) >> 6;
-    if( lane_id * num_loads > emb_dim)
+    if( lane_id * num_loads >= emb_dim)
         return;
     p_offsets += blockIdx.y * batch + bag_id;
     index_t indices_start = p_offsets[0];
