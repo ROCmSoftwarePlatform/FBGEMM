@@ -60,7 +60,7 @@ __device__ half
 llvm_amdgcn_raw_buffer_load_fp16(int32x4_t srsrc,
                                  int32_t voffset,
                                  int32_t soffset,
-                                 int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f16");
+                                 int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.i16");
 
 __device__ float
 llvm_amdgcn_raw_buffer_load_fp32(int32x4_t srsrc,
@@ -72,7 +72,7 @@ __device__ half2
 llvm_amdgcn_raw_buffer_load_fp16x2(int32x4_t srsrc,
                                    int32_t voffset,
                                    int32_t soffset,
-                                   int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v2f16");
+                                   int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.i32");
 
 __device__ floatx2_t
 llvm_amdgcn_raw_buffer_load_fp32x2(int32x4_t srsrc,
