@@ -305,6 +305,7 @@ if(NOT FBGEMM_CPU_ONLY)
     codegen/embedding_backward_dense_host.cpp
     codegen/embedding_bounds_check_host.cpp
     hip_kernel/split_tbe_fwd_hip.cpp
+    hip_kernel/split_tbe_bwd_hip.cpp
     src/cumem_utils_host.cpp
     src/layout_transform_ops_gpu.cpp
     src/permute_pooled_embedding_ops_gpu.cpp
