@@ -6,33 +6,644 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+
 # flake8: noqa F401
 
-from typing import Any, Dict
+import argparse
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-try:
-    from .jinja_environment import generate_optimized_grad_sum_loop_access
-    from .optimizer_args import (
-        FLOAT,
-        INT,
-        INT_TENSOR,
-        LONG_TENSOR,
-        OptimizerArgsSet,
-        TENSOR,
-    )
-except:
-    # pyre-ignore[21]
-    from jinja_environment import generate_optimized_grad_sum_loop_access
+import jinja2
 
-    # pyre-ignore[21]
-    from optimizer_args import (
-        FLOAT,
-        INT,
-        INT_TENSOR,
-        LONG_TENSOR,
-        OptimizerArgsSet,
-        TENSOR,
+args: argparse.Namespace
+_: List[str]
+TENSOR: int
+INT_TENSOR: int
+LONG_TENSOR: int
+INT: int
+FLOAT: int
+
+
+parser = argparse.ArgumentParser()
+# By default the source template files are in the same folder as
+# embedding_backward_code_generator.py;
+# The install dir is by default the same as the current folder.
+parser.add_argument("--install_dir", default=".", help="where to put generated file")
+parser.add_argument("--opensource", action="store_false", dest="is_fbcode")
+parser.add_argument("--is_rocm", action="store_true")
+args, _ = parser.parse_known_args()
+
+
+env = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(os.path.dirname(os.path.abspath(__file__)))
+)
+# Upper Limit of "max_embedding_dim (max_D)":
+# BT_block_size * sizeof(float) * 4 * kWarpSize * {{ kMaxVecsPerThread }}
+# needs to be smaller than the allocated shared memory size (2/3 of 96 KB
+# on V100 and 160 KB on A100.
+# BT_block_size * 4 * 4 * 32 * (max_D // 128) <= 64 * 1024 (V100) or 96 * 1024 (A100)
+# Since BT_block_size >= 1, max_D <= 16K (V100) or 24K (A100).
+# Note that if we increase max_D, it will increase the compilation time significantly.
+env.globals["max_embedding_dim"] = 2048
+# Max embedding dimension for legacy embedding kernels. TBE v2 can support
+# larger max embedding dimension.
+env.globals["legacy_max_embedding_dim"] = 1024
+# An optimization for ROCm
+env.globals["items_per_warp"] = 128 if args.is_rocm is False else 256
+env.globals["dense"] = False
+# The fixed max vectors per thread for different kernels.  The numbers were
+# derived from empirical studies
+env.globals["fixed_max_vecs_per_thread"] = {"backward": 2, "backward_indice_weights": 6}
+env.globals["is_rocm"] = args.is_rocm
+
+######################################################################
+## Helper functions in Jinja's env.globals                          ##
+######################################################################
+
+
+def prepare_string_for_formatting(blob: str, format_keywords: List[str]) -> str:
+    """
+    Replace curly brackets ('{' or '}') with escape characters ('{{' or '}}')
+    to prepare the string to be formatted by `str.format()`. `str.format()`
+    searches curly brackets to find keywords to format. It will run into an
+    error if the string contains curly brackets.
+    """
+    blob = blob.replace("{", "{{").replace("}", "}}")
+    for kw in format_keywords:
+        blob = blob.replace("{{" + kw + "}}", "{" + kw + "}")
+    return blob
+
+
+def generate_optimized_grad_sum_loop_access(
+    blob: str, other_formats: Optional[Dict[str, str]] = None
+) -> str:
+    """
+    Generate an optimized code for grad_sum accessing
+    - The indices of `grad_sum` when `kUseVecBlocking` is true and false are
+      different. When `kUseVecBlocking` is true, `d_vec` is the index.
+      Otherwise, `vec` is the index.
+    - When `kUseVecBlocking` is false, the number times that the for-loop is
+      executed is known at compile time. Thus, we can add the `#pragma unroll`
+      hint to tell the compiler to optimize the for-loop.
+    """
+    blob = prepare_string_for_formatting(blob, ["grad_vec"])
+
+    smem_blob = blob.format(grad_vec="smem_grad_sum[d_vec]")
+    reg_blob = blob.format(grad_vec="grad_sum[vec]")
+    gen_blob = """
+    if (kUseVecBlocking) {
+        // max_vecs is not known at compile time
+        for (int32_t vec = 0;
+            vec < max_vecs &&
+            (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            {smem_blob}
+        }
+    }
+    else {
+        // kFixedMaxVecsPerThread is known at compile time
+        #pragma unroll kFixedMaxVecsPerThread
+        for (int32_t vec = 0;
+            vec < kFixedMaxVecsPerThread
+                && (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            {reg_blob}
+        }
+    }
+    """
+    gen_blob = prepare_string_for_formatting(gen_blob, ["smem_blob", "reg_blob"])
+    gen_blob = gen_blob.format(smem_blob=smem_blob, reg_blob=reg_blob)
+    if other_formats is not None:
+        gen_blob = prepare_string_for_formatting(gen_blob, list(other_formats.keys()))
+        gen_blob = gen_blob.format(**other_formats)
+    return gen_blob
+
+
+def get_max_vecs_template_configs(
+    items_per_warp: int,
+    fixed_max_vecs_per_thread: int,
+    use_subwarp_shuffle: bool,
+    use_vec_blocking: bool,
+) -> List[Tuple[int, int, str]]:
+    """
+    Generate the template configs for each kFixedMaxVecsPerThread,
+    kThreadGroupSize, and kUseVecBlocking
+    """
+    warp_size = items_per_warp // 4
+    configs: List[Tuple[int, int, str]] = []
+
+    if use_vec_blocking:
+        # kFixedMaxVecsPerThread = fixed_max_vecs_per_thread
+        # kThreadGroupSize = kWarpSize
+        # kUseVecBlocking = true
+        configs.append((fixed_max_vecs_per_thread, warp_size, "true"))
+
+    # Generate the cases where an entire embedding row can fit in the
+    # thread-local buffer (i.e., shared memory is not need for grad_sum)
+    if use_subwarp_shuffle:
+        # Generate configs for sub-warp templates
+        group_size = 8  # Smallest group size that TBE supports
+        while group_size < warp_size:
+            # kFixedMaxVecsPerThread = 1
+            # kThreadGroupSize = group_size
+            # kUseVecBlocking = false
+            configs.append((1, group_size, "false"))
+            group_size *= 2
+
+    # Generate configs for the full-warp templates
+    for v in range(1, fixed_max_vecs_per_thread + 1):
+        configs.append((v, warp_size, "false"))
+
+    return configs
+
+
+def dispatch_non_vec_blocking_kernel(
+    items_per_warp: int,
+    fixed_max_vecs_per_thread: int,
+    use_subwarp_shuffle: bool,
+) -> str:
+    """
+    Generate code for kernel dispatching for kernels that do not use vector
+    blocking (i.e., an entire embedding row can fit in the allocated Vec4T
+    buffer)
+    """
+    blob = ""
+    for (
+        kFixedMaxVecsPerThread,
+        kThreadGroupSize,
+        kUseVecBlocking,
+    ) in get_max_vecs_template_configs(
+        items_per_warp,
+        fixed_max_vecs_per_thread,
+        use_subwarp_shuffle,
+        use_vec_blocking=False,
+    ):
+        formats = {
+            "max_D_val": kFixedMaxVecsPerThread * kThreadGroupSize * 4,
+            "kFixedMaxVecsPerThread": kFixedMaxVecsPerThread,
+            "kThreadGroupSize": kThreadGroupSize,
+            "kUseVecBlocking": kUseVecBlocking,
+        }
+        max_D_val = kFixedMaxVecsPerThread * kThreadGroupSize * 4
+        d_blob = """if (MAX_D <= {max_D_val}) {                               \\
+             [[ maybe_unused ]] const int max_vecs_per_thread =               \\
+               {kFixedMaxVecsPerThread};                                      \\
+             constexpr int kFixedMaxVecsPerThread = {kFixedMaxVecsPerThread}; \\
+             [[ maybe_unused ]] constexpr int kThreadGroupSize =              \\
+               {kThreadGroupSize};                                            \\
+             [[ maybe_unused ]] constexpr bool kUseVecBlocking =              \\
+               {kUseVecBlocking};                                             \\
+             return __VA_ARGS__();                                            \\
+           }                                                                  \\
+        """
+        d_blob = prepare_string_for_formatting(d_blob, list(formats.keys()))
+        blob += d_blob.format(**formats)
+    return blob
+
+
+def dispatch_vec_blocking_kernel(
+    items_per_warp: int,
+    fixed_max_vecs_per_thread: int,
+) -> str:
+    """
+    Generate code for kernel dispatching for kernels that use vector blocking
+    (i.e., an entire embedding row cannot fit in the allocated Vec4T buffer)
+    """
+    formats = {
+        "max_D_val": fixed_max_vecs_per_thread * items_per_warp,
+        "items_per_warp": items_per_warp,
+        "fixed_max_vecs_per_thread": fixed_max_vecs_per_thread,
+    }
+    blob = """if (MAX_D > {max_D_val}) {                                     \\
+         [[ maybe_unused ]] const int max_vecs_per_thread =                  \\
+           (MAX_D + {items_per_warp} - 1) / {items_per_warp};                \\
+         constexpr int kFixedMaxVecsPerThread = {fixed_max_vecs_per_thread}; \\
+         [[ maybe_unused ]] constexpr int kThreadGroupSize = kWarpSize;      \\
+         [[ maybe_unused ]] constexpr bool kUseVecBlocking = true;           \\
+         return __VA_ARGS__();                                               \\
+       }                                                                     \\
+    """
+    blob = prepare_string_for_formatting(blob, list(formats.keys()))
+    return blob.format(**formats)
+
+
+def dispatch_optimal_kernel(
+    items_per_warp: int,
+    fixed_max_vecs_per_thread: int,
+    use_subwarp_shuffle: bool,
+) -> str:
+    """
+    Generate code for kernel dispatching for both kernels that use/do not use
+    vector blocking
+    """
+    blob = dispatch_non_vec_blocking_kernel(
+        items_per_warp,
+        fixed_max_vecs_per_thread,
+        use_subwarp_shuffle,
     )
+    blob += dispatch_vec_blocking_kernel(
+        items_per_warp,
+        fixed_max_vecs_per_thread,
+    )
+    return blob
+
+
+def is_valid_forward_config(
+    nobag: bool,
+    weighted: bool,
+    vbe: bool,
+    is_index_select: bool,
+) -> bool:
+    """
+    Check if the given combination of configs is valid for forward
+    - nobag does not have weighted or vbe supports
+    - is_index_select is nobag
+    """
+    return (not nobag or (not weighted and not vbe)) and (
+        nobag or (not is_index_select)
+    )
+
+
+def has_experimental_support(
+    dense: bool, nobag: bool, vbe: bool, is_index_select: bool, is_rocm: bool
+) -> bool:
+    """
+    Check if the given combination of configs has TBE v2 support
+    - TBE v2 does not support dense, nobag, vbe, is_index_select, and is_rocm
+    """
+    return not dense and not nobag and not vbe and not is_index_select and not is_rocm
+
+
+# Make helper functions visible to code gen
+env.globals["generate_optimized_grad_sum_loop_access"] = (
+    generate_optimized_grad_sum_loop_access
+)
+env.globals["get_max_vecs_template_configs"] = get_max_vecs_template_configs
+env.globals["dispatch_optimal_kernel"] = dispatch_optimal_kernel
+env.globals["dispatch_non_vec_blocking_kernel"] = dispatch_non_vec_blocking_kernel
+env.globals["dispatch_vec_blocking_kernel"] = dispatch_vec_blocking_kernel
+env.globals["is_valid_forward_config"] = is_valid_forward_config
+env.globals["has_experimental_support"] = has_experimental_support
+
+
+######################################################################
+## Helper functions for the code generator script                   ##
+######################################################################
+
+
+def write(filename: str, s: str) -> None:
+    with open(os.path.join(args.install_dir, filename), "w") as f:
+        f.write(s)
+
+
+def _arg_constructor(
+    type: str, name: str, gpu: bool = True, precision: int = 32
+) -> str:
+    return (
+        f"{name}.packed_accessor{precision}<{type}, 1, at::RestrictPtrTraits>()"
+        if gpu
+        else f"{name}.accessor<{type}, 1>()"
+    )
+
+
+def _arg(
+    type: str,
+    name: str,
+    gpu: bool = True,
+    precision: int = 32,
+    pass_by_ref: bool = False,
+) -> str:
+    ref = "&" if pass_by_ref else ""
+    return (
+        f"at::PackedTensorAccessor{precision}<{type}, 1, at::RestrictPtrTraits>{ref} {name}"
+        if gpu
+        else f"at::TensorAccessor<{type}, 1>{ref} {name}"
+    )
+
+
+def acc_cache_tensor_arg_constructor(name: str, gpu: bool = True) -> str:
+    return _arg_constructor(
+        "at::acc_type<" + ("cache_t" if gpu else "scalar_t") + ", true>",
+        name,
+        gpu=gpu,
+        precision=64,
+    )
+
+
+def acc_cache_tensor_arg(name: str, gpu: bool = True, pass_by_ref: bool = False) -> str:
+    return _arg(
+        "at::acc_type<" + ("cache_t" if gpu else "scalar_t") + ", true>",
+        name,
+        gpu=gpu,
+        precision=64,
+        pass_by_ref=pass_by_ref,
+    )
+
+
+def long_tensor_arg_constructor(name: str, gpu: bool = True) -> str:
+    return _arg_constructor("int64_t", name, gpu=gpu)
+
+
+def long_tensor_arg(name: str, gpu: bool = True, pass_by_ref: bool = False) -> str:
+    return _arg("int64_t", name, gpu=gpu, pass_by_ref=pass_by_ref)
+
+
+def int_tensor_arg_constructor(name: str, gpu: bool = True) -> str:
+    return _arg_constructor("int32_t", name, gpu=gpu)
+
+
+def int_tensor_arg(name: str, gpu: bool = True, pass_by_ref: bool = False) -> str:
+    return _arg("int32_t", name, gpu=gpu, pass_by_ref=pass_by_ref)
+
+
+def tensor_arg(name: str) -> str:
+    return f"Tensor {name}"
+
+
+def double_arg(name: str, default: float = 0.0) -> str:
+    return f"double {name} = {default}"
+
+
+def double_arg_no_default(name: str) -> str:
+    return f"double {name}"
+
+
+def float_arg(name: str, default: float = 0.0) -> str:
+    return f"float {name} = {default}"
+
+
+def float_arg_no_default(name: str) -> str:
+    return f"float {name}"
+
+
+def int64_arg(name: str, default: int = 0) -> str:
+    return f"int64_t {name} = {default}"
+
+
+def int64_arg_no_default(name: str) -> str:
+    return f"int64_t {name}"
+
+
+def int_arg(name: str, default: int = 0) -> str:
+    return f"int {name} = {default}"
+
+
+# Format the macro call to generate pta::PackedTensorAccessors
+def make_pta_acc_format(pta_str_list: List[str], func_name: str) -> List[str]:
+    new_str_list = []
+    for pta_str in pta_str_list:
+        if "packed_accessor" in pta_str:
+            match = re.search(
+                r"([a-zA-z0-9_]*)[.]packed_accessor([3|6][2|4])<(.*)>\(\)", pta_str
+            )
+            assert match is not None and len(match.groups()) == 3
+            tensor, acc_nbits, args = match.groups()
+            if "acc_type" in args:
+                match = re.search("at::acc_type<([a-zA-Z_]*), true>", args)
+                assert match is not None and len(match.groups()) == 1
+                new_type = match.group(1)
+                args = re.sub("at::acc_type<[a-zA-Z_]*, true>", new_type, args)
+                macro_name = "MAKE_PTA_ACC_WITH_NAME"
+            else:
+                macro_name = "MAKE_PTA_WITH_NAME"
+            args = args.replace(", at::RestrictPtrTraits", "")
+            new_str_list.append(
+                f"{macro_name}({func_name}, {tensor}, {args}, {acc_nbits})"
+            )
+        else:
+            new_str_list.append(pta_str)
+    return new_str_list
+
+
+def replace_pta_namespace(pta_str_list: List[str]) -> List[str]:
+    return [
+        pta_str.replace("at::PackedTensorAccessor", "pta::PackedTensorAccessor")
+        for pta_str in pta_str_list
+    ]
+
+
+env.filters["make_pta_acc_format"] = make_pta_acc_format
+env.filters["replace_pta_namespace"] = replace_pta_namespace
+
+
+@dataclass
+class Args:
+    split_kernel_args: List[str]
+    split_kernel_args_no_defaults: List[str]
+    split_kernel_arg_constructors: List[str]
+    split_cpu_kernel_args: List[str]
+    split_cpu_kernel_arg_constructors: List[str]
+    split_function_args: List[str]
+    split_function_args_no_defaults: List[str]
+    split_saved_tensors: List[str]
+    split_tensors: List[str]
+    saved_data: List[Tuple[str, str]]
+    split_function_arg_names: List[str]
+    split_function_schemas: List[str]
+    split_variables: List[str]
+    split_ref_kernel_args: List[str]
+
+
+TENSOR, INT_TENSOR, LONG_TENSOR, INT, FLOAT = range(5)
+
+
+def make_args(
+    arg_spec: List[Union[Tuple[int, str], Tuple[int, str, Union[float, int]]]]
+) -> Dict[str, Any]:
+    def make_kernel_arg(
+        ty: int, name: str, default: Union[int, float, None], pass_by_ref: bool = False
+    ) -> str:
+        return {
+            TENSOR: lambda x: acc_cache_tensor_arg(x, pass_by_ref=pass_by_ref),
+            INT_TENSOR: lambda x: int_tensor_arg(x, pass_by_ref=pass_by_ref),
+            LONG_TENSOR: lambda x: long_tensor_arg(x, pass_by_ref=pass_by_ref),
+            INT: (
+                (lambda x: int64_arg(x, default=int(default)))
+                if default is not None
+                else int64_arg_no_default
+            ),
+            FLOAT: (
+                (lambda x: float_arg(x, default=default))
+                if default is not None
+                else float_arg_no_default
+            ),
+        }[ty](name)
+
+    def make_kernel_arg_constructor(ty: int, name: str) -> str:
+        return {
+            TENSOR: acc_cache_tensor_arg_constructor,
+            INT_TENSOR: int_tensor_arg_constructor,
+            LONG_TENSOR: long_tensor_arg_constructor,
+            INT: lambda x: x,
+            FLOAT: lambda x: x,
+        }[ty](name)
+
+    def make_cpu_kernel_arg(ty: int, name: str, default: Union[int, float]) -> str:
+        return {
+            TENSOR: lambda x: acc_cache_tensor_arg(x, gpu=False),
+            INT_TENSOR: lambda x: int_tensor_arg(x, gpu=False),
+            LONG_TENSOR: lambda x: long_tensor_arg(x, gpu=False),
+            INT: lambda x: int64_arg(x, default=int(default)),
+            FLOAT: lambda x: float_arg(x, default=default),
+        }[ty](name)
+
+    def make_cpu_kernel_arg_constructor(ty: int, name: str) -> str:
+        return {
+            TENSOR: lambda x: acc_cache_tensor_arg_constructor(x, gpu=False),
+            INT_TENSOR: lambda x: int_tensor_arg_constructor(x, gpu=False),
+            LONG_TENSOR: lambda x: long_tensor_arg_constructor(x, gpu=False),
+            INT: lambda x: x,
+            FLOAT: lambda x: x,
+        }[ty](name)
+
+    def make_function_arg(
+        ty: int, name: str, default: Optional[Union[int, float]]
+    ) -> str:
+        return {
+            TENSOR: tensor_arg,
+            INT_TENSOR: tensor_arg,
+            LONG_TENSOR: tensor_arg,
+            INT: (
+                (lambda x: int64_arg(x, default=int(default)))
+                if default is not None
+                else int64_arg_no_default
+            ),
+            FLOAT: (
+                (lambda x: double_arg(x, default=default))
+                if default is not None
+                else double_arg_no_default
+            ),
+        }[ty](name)
+
+    def make_function_schema_arg(ty: int, name: str, default: Union[int, float]) -> str:
+        return {
+            TENSOR: tensor_arg,
+            INT_TENSOR: tensor_arg,
+            LONG_TENSOR: tensor_arg,
+            INT: lambda x: int_arg(x, default=int(default)),
+            FLOAT: lambda x: float_arg(x, default=default),
+        }[ty](name)
+
+    def make_ivalue_cast(ty: int) -> str:
+        return {INT: "toInt", FLOAT: "toDouble"}[ty]
+
+    def make_args_for_compute_device(
+        split_arg_spec: List[Tuple[int, str, Union[int, float]]]
+    ) -> Args:
+        return Args(
+            split_kernel_args=[
+                make_kernel_arg(ty, name, default)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_kernel_args_no_defaults=[
+                make_kernel_arg(ty, name, None) for (ty, name, _) in split_arg_spec
+            ],
+            split_kernel_arg_constructors=[
+                make_kernel_arg_constructor(ty, name)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_cpu_kernel_args=[
+                make_cpu_kernel_arg(ty, name, default)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_cpu_kernel_arg_constructors=[
+                make_cpu_kernel_arg_constructor(ty, name)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_function_args=[
+                make_function_arg(ty, name, default)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_function_args_no_defaults=[
+                make_function_arg(ty, name, None)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_tensors=[
+                name for (ty, name, default) in augmented_arg_spec if ty == TENSOR
+            ],
+            split_saved_tensors=[
+                name
+                for (ty, name, default) in split_arg_spec
+                if ty in (TENSOR, INT_TENSOR, LONG_TENSOR)
+            ],
+            saved_data=[
+                (name, make_ivalue_cast(ty))
+                for (ty, name, default) in augmented_arg_spec
+                if ty != TENSOR
+            ],
+            split_function_arg_names=[name for (ty, name, default) in split_arg_spec],
+            split_function_schemas=[
+                make_function_schema_arg(ty, name, default)
+                for (ty, name, default) in split_arg_spec
+            ],
+            split_variables=["Variable()" for _ in split_arg_spec],
+            split_ref_kernel_args=[
+                make_kernel_arg(ty, name, default, pass_by_ref=True)
+                for (ty, name, default) in split_arg_spec
+            ],
+        )
+
+    DEFAULT_ARG_VAL = 0
+    augmented_arg_spec = [
+        item if len(item) == 3 else (*item, DEFAULT_ARG_VAL) for item in arg_spec
+    ]
+
+    split_arg_spec = []
+    for ty, arg, default in augmented_arg_spec:
+        if ty in (FLOAT, INT):
+            split_arg_spec.append((ty, arg, default))
+        else:
+            assert ty == TENSOR
+            split_arg_spec.extend(
+                [
+                    (TENSOR, f"{arg}_host", default),
+                    (INT_TENSOR, f"{arg}_placements", default),
+                    (LONG_TENSOR, f"{arg}_offsets", default),
+                ]
+            )
+    cpu = make_args_for_compute_device(split_arg_spec)
+
+    split_arg_spec = []
+    for ty, arg, default in augmented_arg_spec:
+        if ty in (FLOAT, INT):
+            split_arg_spec.append((ty, arg, default))
+        else:
+            assert ty == TENSOR
+            split_arg_spec.extend(
+                [
+                    (TENSOR, f"{arg}_dev", default),
+                    (TENSOR, f"{arg}_uvm", default),
+                    (INT_TENSOR, f"{arg}_placements", default),
+                    (LONG_TENSOR, f"{arg}_offsets", default),
+                ]
+            )
+    cuda = make_args_for_compute_device(split_arg_spec)
+
+    split_arg_spec = []
+    for ty, arg, default in augmented_arg_spec:
+        if ty in (FLOAT, INT):
+            split_arg_spec.append((ty, arg, default))
+        else:
+            assert ty == TENSOR
+            split_arg_spec.extend(
+                [
+                    (TENSOR, f"{arg}_host", default),
+                    (TENSOR, f"{arg}_dev", default),
+                    (TENSOR, f"{arg}_uvm", default),
+                    (INT_TENSOR, f"{arg}_placements", default),
+                    (LONG_TENSOR, f"{arg}_offsets", default),
+                ]
+            )
+    any_device = make_args_for_compute_device(split_arg_spec)
+
+    return {"cpu": cpu, "cuda": cuda, "any_device": any_device}
+
 
 ######################################################################
 ## Optimizer templates                                              ##
@@ -65,7 +676,7 @@ def adagrad() -> Dict[str, Any]:
 
     return {
         "optimizer": "adagrad",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [(TENSOR, "momentum1"), (FLOAT, "eps"), (FLOAT, "learning_rate")]
         ),
         "split_precomputation": "",
@@ -175,8 +786,6 @@ def rowwise_adagrad() -> Dict[str, Any]:
 
     at::acc_type<cache_t, true> multiplier;
     at::acc_type<cache_t, true> correction;
-    multiplier = 0.0;
-    correction = 0.0;
     if (threadIdx.x == 0) {
         at::acc_type<cache_t, true> new_sum_square_grads = momentum1[idx] + g_avg_square;
         momentum1[idx] = new_sum_square_grads;
@@ -228,7 +837,7 @@ def rowwise_adagrad() -> Dict[str, Any]:
 
     return {
         "optimizer": "rowwise_adagrad",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (FLOAT, "eps"),
@@ -259,7 +868,7 @@ def approx_rowwise_adagrad() -> Dict[str, Any]:
 
     return {
         "optimizer": "approx_rowwise_adagrad",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (FLOAT, "eps"),
@@ -364,7 +973,7 @@ def rowwise_adagrad_with_weight_decay() -> Dict[str, Any]:
 
     return {
         "optimizer": "rowwise_adagrad_with_weight_decay",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (FLOAT, "eps"),
@@ -395,7 +1004,7 @@ def approx_rowwise_adagrad_with_weight_decay() -> Dict[str, Any]:
 
     return {
         "optimizer": "approx_rowwise_adagrad_with_weight_decay",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (FLOAT, "eps"),
@@ -557,7 +1166,7 @@ def rowwise_adagrad_with_counter() -> Dict[str, Any]:
 
     return {
         "optimizer": "rowwise_adagrad_with_counter",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (TENSOR, "prev_iter"),
@@ -601,7 +1210,7 @@ def approx_rowwise_adagrad_with_counter() -> Dict[str, Any]:
 
     return {
         "optimizer": "approx_rowwise_adagrad_with_counter",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (TENSOR, "prev_iter"),
@@ -696,7 +1305,7 @@ def rowwise_weighted_adagrad() -> Dict[str, Any]:
     return {
         "optimizer": "rowwise_weighted_adagrad",
         "is_experimental_optimizer": True,
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (FLOAT, "eps"),
@@ -727,7 +1336,7 @@ def sgd() -> Dict[str, Any]:
 
     return {
         "optimizer": "sgd",
-        "args": OptimizerArgsSet.create([(FLOAT, "learning_rate")]),
+        "args": make_args([(FLOAT, "learning_rate")]),
         "split_precomputation": "",
         "split_weight_update": split_weight_update,
         "split_post_update": "",
@@ -750,7 +1359,7 @@ def approx_sgd() -> Dict[str, Any]:
 
     return {
         "optimizer": "approx_sgd",
-        "args": OptimizerArgsSet.create([(FLOAT, "learning_rate")]),
+        "args": make_args([(FLOAT, "learning_rate")]),
         "split_precomputation": "",
         "split_weight_update": approx_split_weight_update,
         "split_post_update": "",
@@ -816,7 +1425,7 @@ def lamb() -> Dict[str, Any]:
     return {
         "optimizer": "lamb",
         "is_experimental_optimizer": True,
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (TENSOR, "momentum2"),
@@ -856,7 +1465,7 @@ def partial_rowwise_lamb() -> Dict[str, Any]:
         warpReduceAllSum<at::acc_type<cache_t, true>, kThreadGroupSize>(g_local_sum_square, shfl_sync_mask) / D;
 
     at::acc_type<cache_t, true> m2;
-    m2  = 0.0;
+    m2 = 0.0;
     if (threadIdx.x == 0) {
         m2 = beta2 * momentum2[idx] + (1.0 - beta2) * g_avg_square;
         momentum2[idx] = m2;
@@ -908,7 +1517,7 @@ def partial_rowwise_lamb() -> Dict[str, Any]:
 
     return {
         "optimizer": "partial_rowwise_lamb",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (TENSOR, "momentum2"),
@@ -963,7 +1572,7 @@ def adam() -> Dict[str, Any]:
     return {
         "optimizer": "adam",
         "is_experimental_optimizer": True,
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (TENSOR, "momentum2"),
@@ -1030,7 +1639,7 @@ def partial_rowwise_adam() -> Dict[str, Any]:
 
     return {
         "optimizer": "partial_rowwise_adam",
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (TENSOR, "momentum2"),
@@ -1097,7 +1706,7 @@ def lars_sgd() -> Dict[str, Any]:
     return {
         "optimizer": "lars_sgd",
         "is_experimental_optimizer": True,
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (TENSOR, "momentum1"),
                 (FLOAT, "learning_rate"),
@@ -1120,7 +1729,7 @@ def none_optimizer() -> Dict[str, Any]:
     return {
         "optimizer": "none",
         "dense": False,
-        "args": OptimizerArgsSet.create(
+        "args": make_args(
             [
                 (INT, "total_hash_size"),
                 (INT, "total_unique_indices"),
