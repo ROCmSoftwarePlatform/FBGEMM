@@ -22,6 +22,9 @@ parser.add_argument(
 )
 parser.add_argument("--opensource", action="store_false", dest="is_fbcode")
 parser.add_argument("--is_rocm", action="store_true")
+parser.add_argument(
+    "--rocm_wavesize", type=int, default=64, help="Wavesize for AMD GPUs"
+)
 
 args: argparse.Namespace
 _: List[str]

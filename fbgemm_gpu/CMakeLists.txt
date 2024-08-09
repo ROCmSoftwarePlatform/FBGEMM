@@ -40,6 +40,8 @@ if((NOT FBGEMM_CPU_ONLY) AND
     "will default to ROCm build"
   )
   set(USE_ROCM ON)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ArchMacros.cmake)
+  GET_AMD_WAVESIZE(AMD_WAVESIZE)
 endif()
 
 if(FBGEMM_CPU_ONLY)
@@ -286,17 +288,19 @@ set(WEIGHT_OPTIONS
 
 macro(RUN_GEN_SCRIPT SCRIPT)
   set(rocm_flag "")
+  set(rocm_wavesize "")
   if(USE_ROCM)
     set(rocm_flag --is_rocm)
+    set(rocm_wavesize --rocm_wavesize=${AMD_WAVESIZE})
   endif()
 
   BLOCK_PRINT(
     "Running code generation script ..."
-    "${PYTHON_EXECUTABLE} ${SCRIPT} --opensource ${rocm_flag}"
+    "${PYTHON_EXECUTABLE} ${SCRIPT} --opensource ${rocm_flag} ${rocm_wavesize}"
   )
 
   execute_process(
-    COMMAND "${PYTHON_EXECUTABLE}" ${SCRIPT} "--opensource" ${rocm_flag})
+    COMMAND "${PYTHON_EXECUTABLE}" ${SCRIPT} "--opensource" ${rocm_flag} ${rocm_wavesize})
 endmacro()
 
 foreach(script

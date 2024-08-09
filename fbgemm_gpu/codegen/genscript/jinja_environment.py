@@ -61,8 +61,16 @@ env.globals["max_embedding_dim"] = 2048
 # larger max embedding dimension.
 env.globals["legacy_max_embedding_dim"] = 1024
 
+# AMD wavesize validity check
+if args.is_rocm is True and args.rocm_wavesize not in [32, 64]:
+    raise Exception("Wavesize for AMD GPU should be 32 or 64")
+
 # An optimization for ROCm
-env.globals["items_per_warp"] = 128 if args.is_rocm is False else 256
+env.globals["items_per_warp"] = (
+    128
+    if args.is_rocm is False or (args.is_rocm is True and args.rocm_wavesize == 32)
+    else 256
+)
 
 # The fixed max vectors per thread for different kernels.  The numbers were
 # derived from empirical studies
@@ -70,6 +78,7 @@ env.globals["fixed_max_vecs_per_thread"] = {"backward": 2, "backward_indice_weig
 
 env.globals["dense"] = False
 env.globals["is_rocm"] = args.is_rocm
+env.globals["rocm_wavesize"] = args.rocm_wavesize
 
 
 ################################################################################

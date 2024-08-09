@@ -30,8 +30,14 @@
 #endif
 
 #ifdef USE_ROCM
+#include "fbgemm_gpu/amd_device_arch.h"
+#if defined(AMD_ARCH_NAVI)
+constexpr int32_t kThreadsPerWarp = 32;
+constexpr int32_t kWarpsPerBlock = 32;
+#else
 constexpr int32_t kThreadsPerWarp = 64;
 constexpr int32_t kWarpsPerBlock = 16;
+#endif
 #else
 constexpr int32_t kThreadsPerWarp = 32;
 constexpr int32_t kWarpsPerBlock = 32;

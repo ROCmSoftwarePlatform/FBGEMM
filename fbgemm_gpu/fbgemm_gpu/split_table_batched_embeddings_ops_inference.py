@@ -147,6 +147,23 @@ def random_quant_scaled_tensor(
         )
 
 
+NAVI_ARCH = [
+    "gfx1010",
+    "gfx1011",
+    "gfx1012",
+    "gfx1030",
+    "gfx1031",
+    "gfx1032",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+]
+
+
+def is_amd_arch_navi() -> bool:
+    return torch.cuda.get_device_properties(0).gcnArchName in NAVI_ARCH
+
+
 # pyre-fixme[13]: Attribute `cache_miss_counter` is never initialized.
 class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
     """
@@ -195,7 +212,11 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
         super(IntNBitTableBatchedEmbeddingBagsCodegen, self).__init__()
 
         # 64 for AMD
-        if cache_assoc == 32 and torch.version.hip is not None:
+        if (
+            cache_assoc == 32
+            and torch.version.hip is not None
+            and not is_amd_arch_navi()
+        ):
             cache_assoc = 64
 
         if device is None:

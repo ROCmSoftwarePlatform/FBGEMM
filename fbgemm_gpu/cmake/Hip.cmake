@@ -12,21 +12,7 @@ else()
   set(ROCM_PATH $ENV{ROCM_PATH})
 endif()
 
-macro(torch_hip_get_arch_list store_var)
-  if(DEFINED ENV{PYTORCH_ROCM_ARCH})
-    set(_TMP $ENV{PYTORCH_ROCM_ARCH})
-  else()
-    # Use arch of installed GPUs as default
-    execute_process(COMMAND "rocm_agent_enumerator" COMMAND bash "-c" "grep -v gfx000 | sort -u | xargs | tr -d '\n'"
-                    RESULT_VARIABLE ROCM_AGENT_ENUMERATOR_RESULT
-                    OUTPUT_VARIABLE ROCM_ARCH_INSTALLED)
-    if(NOT ROCM_AGENT_ENUMERATOR_RESULT EQUAL 0)
-      message(FATAL_ERROR " Could not detect ROCm arch for GPUs on machine. Result: '${ROCM_AGENT_ENUMERATOR_RESULT}'")
-    endif()
-    set(_TMP ${ROCM_ARCH_INSTALLED})
-  endif()
-  string(REPLACE " " ";" ${store_var} "${_TMP}")
-endmacro()
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ArchMacros.cmake)
 
 torch_hip_get_arch_list(PYTORCH_ROCM_ARCH)
 if(PYTORCH_ROCM_ARCH STREQUAL "")
@@ -36,6 +22,7 @@ message("Building FBGEMM for GPU arch: ${PYTORCH_ROCM_ARCH}")
 
 ADD_DEFINITIONS(-DNDEBUG)
 ADD_DEFINITIONS(-DUSE_ROCM)
+ADD_DEFINITIONS(-DAMD_WAVESIZE=${AMD_WAVESIZE})
 
 # Add HIP to the CMAKE Module Path
 set(CMAKE_MODULE_PATH ${ROCM_PATH}/lib/cmake/hip ${CMAKE_MODULE_PATH})
