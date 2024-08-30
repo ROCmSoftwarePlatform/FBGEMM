@@ -46,7 +46,7 @@ except Exception:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu/codegen:index_select_ops")
 
 import torch.utils._pytree as pytree
-from torch import Tensor
+from torch import SymInt, Tensor
 
 
 if hasattr(torch.library, "impl_abstract"):
@@ -273,6 +273,8 @@ def check_all_same_device(*tensors: Optional[Tensor]) -> None:
             continue
         if first_tensor is None:
             first_tensor = tensor
+        if first_tensor.device.type == "cpu" and tensor.device.type == "cpu":
+            return
         torch._check(tensor.device == first_tensor.device)
 
 
@@ -556,3 +558,21 @@ def keyed_jagged_index_select_dim1_abstract(
         ret.append(weights.new_empty([selected_lengths_sum]))
 
     return ret
+
+
+@impl_abstract("fbgemm::bounds_check_indices")
+def bounds_check_indices_abstract(
+    rows_per_table: torch.Tensor,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    bounds_check_mode_int: int,
+    bounds_check_warning: torch.Tensor,
+    per_sample_weights: Optional[torch.Tensor] = None,
+    B_offsets: Optional[torch.Tensor] = None,
+    max_B: Optional[SymInt] = None,
+) -> None:
+    """
+    This meta function is used to fake the bounds checking
+    from the original function `fbgemm::bounds_check_indices`
+    """
+    return

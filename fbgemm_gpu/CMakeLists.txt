@@ -10,18 +10,12 @@
 
 cmake_minimum_required(VERSION 3.25.0 FATAL_ERROR)
 
-function(BLOCK_PRINT)
-  message("================================================================================")
-  foreach(ARG IN LISTS ARGN)
-     message("${ARG}")
-  endforeach()
-  message("================================================================================")
-  message("")
-endfunction()
-
 set(CMAKEMODULES ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/modules)
 set(FBGEMM ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(THIRDPARTY ${FBGEMM}/third_party)
+set(CMAKE_CODEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/codegen)
+
+include(${CMAKEMODULES}/Utilities.cmake)
 
 
 ################################################################################
@@ -52,79 +46,11 @@ endif()
 
 
 ################################################################################
-# FBGEMM_GPU C++ Setup
-################################################################################
-
-# Set the default C++ standard to C++20 if CMAKE_CXX_STANDARD is not supplied
-# by CMake command invocation.
-# Individual targets can have this value overridden; see
-# https://cmake.org/cmake/help/latest/variable/CMAKE_CXX_STANDARD.html
-# https://cmake.org/cmake/help/latest/prop_tgt/CXX_STANDARD.html
-# https://cmake.org/cmake/help/latest/prop_tgt/HIP_STANDARD.html
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 20)
-  set(CMAKE_HIP_STANDARD 20)
-  set(CXX_STANDARD 20)
-  set(HIP_STANDARD 20)
-endif()
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(HIP_STANDARD_REQUIRED ON)
-
-# Set the default C standard to C17
-# Individual targets can have this value overridden; see
-# https://cmake.org/cmake/help/latest/variable/CMAKE_C_STANDARD.html
-# https://cmake.org/cmake/help/latest/prop_tgt/C_STANDARD.html
-set(C_STANDARD 20)
-set(CMAKE_C_STANDARD 17)
-set(CMAKE_C_EXTENSIONS OFF)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-
-if(DEFINED GLIBCXX_USE_CXX11_ABI)
-  if(${GLIBCXX_USE_CXX11_ABI} EQUAL 1)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
-  else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-  endif()
-endif()
-
-BLOCK_PRINT(
-  "Default C compiler flags"
-  "(values may be overridden by CMAKE_CXX_STANDARD and CXX_STANDARD):"
-  ""
-  "${CMAKE_C_FLAGS}"
-)
-
-BLOCK_PRINT(
-  "Default C++ compiler flags"
-  "(values may be overridden by CMAKE_CXX_STANDARD and CXX_STANDARD):"
-  ""
-  "${CMAKE_CXX_FLAGS}"
-)
-
-# Strip all symbols from the .SO file after building
-add_link_options($<$<CONFIG:RELEASE>:-s>)
-
-# Set flags for AVX2
-set(AVX2_FLAGS "-mavx2;-mf16c;-mfma;-fopenmp")
-if(NOT FBGEMM_CPU_ONLY AND WSL_MODE)
-  # NVCC in WSL complains about unknown -mavx options
-  # https://github.com/pytorch/FBGEMM/issues/2135
-  set(AVX2_FLAGS "-Xcompiler;-mavx;-Xcompiler;-mavx2;-Xcompiler;-mf16c;-Xcompiler;-mfma;-fopenmp")
-endif()
-
-# Set flags for AVX512
-set(AVX512_FLAGS "-mavx2;-mf16c;-mfma;-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-fopenmp")
-if(NOT FBGEMM_CPU_ONLY AND WSL_MODE)
-  set(AVX512_FLAGS "-Xcompiler;-mavx2;-Xcompiler;-mf16c;-Xcompiler;-mfma;-Xcompiler;-mavx512f;-Xcompiler;-mavx512bw;-Xcompiler;-mavx512dq;-Xcompiler;-mavx512vl;-fopenmp")
-endif()
-
-set(CMAKE_CODEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/codegen)
-
-
-################################################################################
 # FBGEMM_GPU Build Kickstart
 ################################################################################
+
+# FBGEMM_GPU C++ Setup - must be set BEFORE project declaration
+include(${CMAKEMODULES}/CxxCompilerSetup.cmake)
 
 if(SKBUILD)
   BLOCK_PRINT("The project is built using scikit-build")
@@ -133,59 +59,24 @@ endif()
 if(FBGEMM_CPU_ONLY OR USE_ROCM)
   project(
     fbgemm_gpu
-    VERSION 0.3.1
+    VERSION 0.7.0
     LANGUAGES CXX C)
 else()
   project(
     fbgemm_gpu
-    VERSION 0.3.1
+    VERSION 0.7.0
     LANGUAGES CXX C CUDA)
 endif()
 
+# AVX Flags Setup - must be set AFTER project declaration
 include(${CMAKEMODULES}/FindAVX.cmake)
 
-
-################################################################################
 # PyTorch Dependencies Setup
-################################################################################
+include(${CMAKEMODULES}/PyTorchSetup.cmake)
 
-find_package(Torch REQUIRED)
-
-#
-# Toch Cuda Extensions are normally compiled with the flags below. However we
-# disabled -D__CUDA_NO_HALF_CONVERSIONS__ here as it caused "error: no suitable
-# constructor exists to convert from "int" to "__half" errors in
-# gen_embedding_forward_quantized_split_[un]weighted_codegen_cuda.cu
-#
-
-set(TORCH_CUDA_OPTIONS
-    --expt-relaxed-constexpr -D__CUDA_NO_HALF_OPERATORS__
-    # -D__CUDA_NO_HALF_CONVERSIONS__
-    -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__)
-
-
-################################################################################
 # CUDA Setup
-################################################################################
+include(${CMAKEMODULES}/CudaSetup.cmake)
 
-# Set NVML_LIB_PATH if provided, or detect the default lib path
-if(NOT NVML_LIB_PATH)
-  set(DEFAULT_NVML_LIB_PATH
-      "${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs/libnvidia-ml.so")
-
-  if(EXISTS ${DEFAULT_NVML_LIB_PATH})
-    message(STATUS "Setting NVML_LIB_PATH: \
-      ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs/libnvidia-ml.so")
-    set(NVML_LIB_PATH "${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs/libnvidia-ml.so")
-  endif()
-endif()
-
-if(NVML_LIB_PATH)
-  message(STATUS "Found NVML_LIB_PATH: ${NVML_LIB_PATH}")
-endif()
-
-
-################################################################################
 # ROCm and HIPify Setup
 ################################################################################
 
@@ -223,7 +114,6 @@ endif()
 
 file(GLOB_RECURSE asmjit_sources
   "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/asmjit/src/asmjit/*/*.cpp")
-
 
 ################################################################################
 # Optimizer Group Definitions
@@ -300,9 +190,11 @@ macro(RUN_GEN_SCRIPT SCRIPT)
 endmacro()
 
 foreach(script
-    "${CMAKE_CODEGEN_DIR}/embedding_backward_code_generator.py"
+    "${CMAKE_CODEGEN_DIR}/genscript/generate_backward_split.py"
     "${CMAKE_CODEGEN_DIR}/genscript/generate_embedding_optimizer.py"
-    "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_quantized.py")
+    "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_quantized.py"
+    "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_split.py"
+    "${CMAKE_CODEGEN_DIR}/genscript/generate_index_select.py")
     RUN_GEN_SCRIPT(${script})
 endforeach()
 
@@ -371,7 +263,9 @@ set(gen_cpu_source_files
     "gen_embedding_forward_quantized_weighted_codegen_cpu.cpp"
     "gen_embedding_backward_dense_split_cpu.cpp")
 
-set(gen_python_source_files ${CMAKE_BINARY_DIR}/__init__.py)
+set(gen_python_source_files
+  ${CMAKE_BINARY_DIR}/__init__.py
+  ${CMAKE_BINARY_DIR}/lookup_args.py)
 
 # For each of the optimizers, generate the backward split variant by adding
 # the Python, CPU-only, GPU host, and GPU kernel source files
@@ -438,6 +332,9 @@ foreach(optimizer ${DEFUSED_OPTIMIZERS})
   list(APPEND gen_defused_optim_py_files
     "${CMAKE_BINARY_DIR}/split_embedding_optimizer_${optimizer}.py")
 endforeach()
+
+list(APPEND gen_defused_optim_py_files
+    ${CMAKE_BINARY_DIR}/optimizer_args.py)
 
 
 ################################################################################
@@ -555,10 +452,10 @@ set_source_files_properties(${fbgemm_sources}
 ################################################################################
 
 set(fbgemm_gpu_sources_static_cpu
-    codegen/embedding_forward_split_cpu.cpp
+    codegen/training/forward/embedding_forward_split_cpu.cpp
     codegen/inference/embedding_forward_quantized_host_cpu.cpp
-    codegen/embedding_backward_dense_host_cpu.cpp
-    codegen/embedding_bounds_check_host_cpu.cpp
+    codegen/training/backward/embedding_backward_dense_host_cpu.cpp
+    codegen/utils/embedding_bounds_check_host_cpu.cpp
     src/merge_pooled_embedding_ops/merge_pooled_embedding_ops_cpu.cpp
     src/permute_pooled_embedding_ops/permute_pooled_embedding_function.cpp
     src/permute_pooled_embedding_ops/permute_pooled_embedding_ops_cpu.cpp
@@ -578,13 +475,13 @@ set(fbgemm_gpu_sources_static_cpu
     src/split_embeddings_cache/lru_cache_populate_byte.cpp
     src/split_embeddings_cache/lxu_cache.cpp
     src/split_embeddings_cache/split_embeddings_cache_ops.cpp
-    codegen/batch_index_select_dim0_cpu_host.cpp)
+    codegen/training/index_select/batch_index_select_dim0_cpu_host.cpp)
 
 if(NOT FBGEMM_CPU_ONLY)
   list(APPEND fbgemm_gpu_sources_static_cpu
     codegen/inference/embedding_forward_quantized_host.cpp
-    codegen/embedding_backward_dense_host.cpp
-    codegen/embedding_bounds_check_host.cpp
+    codegen/training/backward/embedding_backward_dense_host.cpp
+    codegen/utils/embedding_bounds_check_host.cpp
     src/memory_utils/memory_utils.cpp
     src/memory_utils/memory_utils_ops.cpp
     src/memory_utils/memory_utils_ops_cpu.cpp
@@ -598,7 +495,7 @@ if(NOT FBGEMM_CPU_ONLY)
     src/metric_ops/metric_ops_host.cpp
     src/embedding_inplace_ops/embedding_inplace_update_gpu.cpp
     src/input_combine_ops/input_combine_gpu.cpp
-    codegen/batch_index_select_dim0_host.cpp)
+    codegen/training/index_select/batch_index_select_dim0_host.cpp)
 
   if(NVML_LIB_PATH OR USE_ROCM)
     message(STATUS "Adding merge_pooled_embeddings sources")
@@ -622,7 +519,7 @@ endif()
 
 if(NOT FBGEMM_CPU_ONLY)
   set(fbgemm_gpu_sources_static_gpu
-      codegen/embedding_bounds_check.cu
+      codegen/utils/embedding_bounds_check.cu
       codegen/inference/embedding_forward_quantized_split_lookup.cu
       src/memory_utils/memory_utils.cu
       src/memory_utils/memory_utils_ops.cu
@@ -797,6 +694,12 @@ if(NVML_LIB_PATH)
   target_link_libraries(fbgemm_gpu_py ${NVML_LIB_PATH})
 endif()
 
+# Silence warnings in asmjit
+target_compile_options(fbgemm_gpu_py PRIVATE
+  -Wno-deprecated-anon-enum-enum-conversion)
+target_compile_options(fbgemm_gpu_py PRIVATE
+  -Wno-deprecated-declarations)
+
 
 ################################################################################
 # FBGEMM_GPU Install
@@ -808,11 +711,13 @@ install(TARGETS fbgemm_gpu_py
 install(FILES ${gen_python_source_files}
         DESTINATION fbgemm_gpu/split_embedding_codegen_lookup_invokers)
 
-install(FILES ${CMAKE_CODEGEN_DIR}/lookup_args.py
-        DESTINATION fbgemm_gpu/split_embedding_codegen_lookup_invokers)
-
 install(FILES ${gen_defused_optim_py_files}
         DESTINATION fbgemm_gpu/split_embedding_optimizer_codegen)
 
-install(FILES ${CMAKE_CODEGEN_DIR}/optimizer_args.py
-        DESTINATION fbgemm_gpu/split_embedding_optimizer_codegen)
+
+
+################################################################################
+# Build Experimental Modules
+################################################################################
+
+add_subdirectory(experimental/example)
