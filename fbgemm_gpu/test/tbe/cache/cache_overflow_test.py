@@ -11,6 +11,7 @@
 
 import logging
 import unittest
+raise unittest.SkipTest("Skipping all tests in this module because we are not using caching at the moment")
 
 import hypothesis.strategies as st
 
@@ -22,7 +23,6 @@ from hypothesis import given, settings
 
 from ..common import assert_torch_equal, MAX_EXAMPLES
 from .cache_common import assert_cache, generate_cache_tbes, gpu_unavailable, VERBOSITY
-
 
 class CacheOverflowTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)

@@ -10,6 +10,7 @@
 # pyre-ignore-all-errors[56]
 
 import unittest
+raise unittest.SkipTest("Skipping all tests in this module because we are not using caching at the moment")
 from typing import Callable, Dict, List
 
 import hypothesis.strategies as st

@@ -99,3 +99,8 @@ _deps
 
 # Sphinx repos
 pytorch-sphinx-theme/
+
+# Local test
+error_logs/
+*.log
+*.xlsx

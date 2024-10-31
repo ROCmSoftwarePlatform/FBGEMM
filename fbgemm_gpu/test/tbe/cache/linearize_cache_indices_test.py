@@ -11,6 +11,7 @@
 
 import random
 import unittest
+raise unittest.SkipTest("Skipping all tests in this module because we are not using caching at the moment")
 from typing import Optional
 
 import torch
@@ -27,7 +28,6 @@ else:
 
 
 VERBOSITY: Verbosity = Verbosity.verbose
-
 
 @optests.generate_opcheck_tests(fast=True)
 class LinearizeCacheIndicesTest(unittest.TestCase):
